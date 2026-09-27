@@ -44,6 +44,9 @@
 //! | `"Delegate must differ from beneficiary"` | `create_delegation` with `delegate == beneficiary` |
 //! | `"Max amount must be positive"` | `create_delegation` with `max_amount` = `Some(n)` where `n <= 0` |
 //! | `"Expiry must be in the future"` | `create_delegation` with `expires_at_ledger` at or before the current ledger sequence |
+//!
+//! The full [`VestFlowError`] code table, with a remediation step for every
+//! variant, lives in `docs/contract-errors.md`.
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, token, vec, xdr::ToXdr,
@@ -458,6 +461,29 @@ pub struct StreamsState {
     pub last_update: u64,
     /// Funded balance still available for streaming, or 0 if unconfigured.
     pub balance: i128,
+}
+
+/// One historical stretch of streaming activity for a single (account, token)
+/// pair, used to reconstruct balance at a past timestamp.
+///
+/// A segment is a half-open interval `[start_time, end_time)` during which the
+/// account's configured receivers streamed at a constant total rate. Segments let
+/// off-chain indexers replay a configuration that has since been overwritten by
+/// `set_stream`, so [`VestFlowContract::balance_at`] can answer historical
+/// balance queries without the contract having to persist every past config.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct StreamsHistory {
+    /// Ledger timestamp this segment began.
+    pub start_time: u64,
+    /// Ledger timestamp this segment ended. `0` means the segment is still
+    /// running, in which case it is evaluated as extending to the current
+    /// ledger timestamp.
+    pub end_time: u64,
+    /// Streaming balance still available when this segment started. Depletion
+    /// accrued inside the segment is capped by this value so a segment can
+    /// never account for more than it was funded with.
+    pub funded: i128,
 }
 
 /// A contract WASM upgrade that has been announced on-chain but not yet executed.
@@ -4974,6 +5000,106 @@ impl VestFlowContract {
         env.crypto().sha256(&encoded).to_bytes()
     }
 
+    /// Streaming balance of `account` for `token` as it stood at ledger
+    /// timestamp `at` (#598).
+    ///
+    /// Pure view: nothing is read-modified-written, so it is safe to call from
+    /// simulations and simulations/dry-runs. The result is
+    ///
+    /// ```text
+    /// balance_at = max(0, funded - committed_at)
+    /// ```
+    ///
+    /// where `funded` is the total ever deposited into the pair's
+    /// [`DataKey::StreamBalance`], and `committed_at` is the sum of
+    ///
+    /// - every segment in `history`, each contributing
+    ///   `min(funded_segment, elapsed * total_rate)` over its
+    ///   `[start_time, end_time)` interval clipped to `at` (an `end_time` of `0`
+    ///   means the segment is still running and extends to now), and
+    /// - the current run, contributing `(min(at, now) - last_update) * total_rate`
+    ///   using the rates of the current run.
+    ///
+    /// `receivers` supplies the rates for the current run. Passing an empty
+    /// list falls back to the receivers stored by the last `set_stream` for
+    /// `(account, token)`, so the common case is
+    /// `balance_at(account, token, at, vec![], vec![])`.
+    ///
+    /// `at` may be in the future, in which case the current run is only
+    /// projected up to the current ledger timestamp — a future view is clamped
+    /// rather than extrapolated, so the answer is never larger than what is
+    /// already committed today.
+    ///
+    /// Returns 0 when the pair was never funded.
+    pub fn balance_at(
+        env: Env,
+        account: Address,
+        token: Address,
+        at: u64,
+        receivers: Vec<StreamReceiver>,
+        history: Vec<StreamsHistory>,
+    ) -> i128 {
+        let funded: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::StreamBalance(account.clone(), token.clone()))
+            .unwrap_or(0);
+        if funded <= 0 {
+            return 0;
+        }
+
+        let config: Option<AccountTokenStreams> = env
+            .storage()
+            .instance()
+            .get(&DataKey::AccountTokenStreams(account.clone(), token.clone()));
+
+        let run_receivers: Vec<StreamReceiver> = if receivers.is_empty() {
+            match &config {
+                Some(c) => c.receivers.clone(),
+                None => Vec::new(&env),
+            }
+        } else {
+            receivers
+        };
+        let total_rate: i128 = run_receivers
+            .iter()
+            .map(|receiver| receiver.amt_per_sec.max(0))
+            .sum();
+
+        let now: u64 = env.ledger().timestamp();
+        let run_end: u64 = if at < now { at } else { now };
+        let run_start: u64 = match &config {
+            Some(c) => c.last_update,
+            None => 0,
+        };
+
+        let mut committed: i128 = 0;
+
+        if total_rate > 0 {
+            for segment in history.iter() {
+                let segment_end: u64 = if segment.end_time == 0 {
+                    now
+                } else {
+                    segment.end_time
+                };
+                let effective_end: u64 = if at < segment_end { at } else { segment_end };
+                let elapsed: i128 = effective_end.saturating_sub(segment.start_time) as i128;
+                if elapsed <= 0 || segment.funded <= 0 {
+                    continue;
+                }
+                let segment_committed = elapsed
+                    .saturating_mul(total_rate)
+                    .min(segment.funded);
+                committed = committed.saturating_add(segment_committed);
+            }
+
+            let run_elapsed: i128 = run_end.saturating_sub(run_start) as i128;
+            committed = committed.saturating_add(run_elapsed.saturating_mul(total_rate));
+        }
+
+        funded.saturating_sub(committed).max(0)
+    }
+
     pub fn nft_split(env: Env, token_id: u128, weight: u128) -> NftSplitsReceiver {
         let nft_contract = env
             .storage()
@@ -5060,6 +5186,131 @@ impl VestFlowContract {
         );
 
         Ok(())
+    }
+
+    /// Collect `account`'s collectable `token` balance and route it to
+    /// `curr_receivers` in proportion to their weights (#597).
+    ///
+    /// This is the collect-and-split entry point: unlike
+    /// [`VestFlowContract::split`], which splits an explicitly supplied
+    /// `amount` that the caller transfers in, this variant reads the balance
+    /// `account` has already earned from its incoming streams and sweeps it
+    /// straight out to the split receivers without an intermediate
+    /// `collect` round trip. (It is named `split_collect` because `split` is
+    /// already taken by the amount-based variant; the semantics are the ones
+    /// the issue describes.)
+    ///
+    /// Returns `(collected, split_to_others)`:
+    ///
+    /// - `collected` — the total swept and apportioned,
+    /// - `split_to_others` — the amount actually transferred to receivers.
+    ///
+    /// Integer division makes `split_to_others <= collected`; the remainder
+    /// from rounding is deliberately left with `account`, whose unpaid accrual
+    /// is left in the contract and remains claimable.
+    ///
+    /// `curr_receivers` is the splits list to apply. Pass the account's stored
+    /// configuration (as returned by
+    /// [`VestFlowContract::splits`]) to split according to what is on-chain, or
+    /// supply a caller-chosen list for a one-off split. An empty list, a list
+    /// whose weights all zero out, or a `collected` of 0 is a no-op that
+    /// returns `(0, 0)` and leaves the accrual untouched.
+    ///
+    /// Shares for NFT-gated receivers are paid to whoever owns the referenced
+    /// NFT at call time (`owner_of`). A receiver whose NFT owner cannot be
+    /// resolved is skipped and its share stays with `account` rather than
+    /// reverting the whole split.
+    pub fn split_collect(
+        env: Env,
+        account: Address,
+        token: Address,
+        curr_receivers: Vec<SplitReceiver>,
+    ) -> (i128, i128) {
+        account.require_auth();
+
+        if curr_receivers.is_empty() {
+            env.events()
+                .publish((symbol_short!("split"), account, token), (0_i128, 0_i128));
+            return (0, 0);
+        }
+
+        let total_weight: u128 = curr_receivers
+            .iter()
+            .map(|receiver| match &receiver {
+                SplitReceiver::Address(receiver) => receiver.weight,
+                SplitReceiver::Nft(receiver) => receiver.weight,
+            })
+            .sum();
+        if total_weight == 0 {
+            env.events()
+                .publish((symbol_short!("split"), account, token), (0_i128, 0_i128));
+            return (0, 0);
+        }
+
+        let accrued_key = DataKey::Accrued(account.clone(), token.clone());
+        let accrued: i128 = env.storage().instance().get(&accrued_key).unwrap_or(0);
+        let collectable = Self::collectable_amount(env.clone(), account.clone(), token.clone());
+        // `collectable_amount` projects from the drips-stream configuration while
+        // `Accrued` tracks what `receive_streams` has booked. When both are in
+        // play, only the amount backed by both can actually be swept.
+        let collected: i128 = if accrued > 0 {
+            collectable.min(accrued)
+        } else {
+            collectable
+        };
+        if collected <= 0 {
+            env.events()
+                .publish((symbol_short!("split"), account, token), (0_i128, 0_i128));
+            return (0, 0);
+        }
+
+        let contract_address = env.current_contract_address();
+        let token_client = token::Client::new(&env, &token);
+        let collected_units: u128 = collected as u128;
+
+        let mut split_to_others: i128 = 0;
+        for receiver in curr_receivers.iter() {
+            let (recipient, weight) = match &receiver {
+                SplitReceiver::Address(receiver) => (receiver.receiver.clone(), receiver.weight),
+                SplitReceiver::Nft(receiver) => match resolve_nft_owner(
+                    &env,
+                    &receiver.nft_contract,
+                    receiver.token_id,
+                ) {
+                    Ok(owner) => (owner, receiver.weight),
+                    Err(_) => continue,
+                },
+            };
+            let share = collected_units
+                .checked_mul(weight)
+                .expect("Split share overflow")
+                .checked_div(total_weight)
+                .expect("Split share computation failed") as i128;
+            if share > 0 {
+                token_client.transfer(&contract_address, &recipient, &share);
+                split_to_others = split_to_others
+                    .checked_add(share)
+                    .expect("Split total overflow");
+            }
+        }
+
+        if split_to_others > 0 {
+            env.storage().instance().set(
+                &accrued_key,
+                &accrued.saturating_sub(split_to_others).max(0),
+            );
+            env.storage().instance().extend_ttl(
+                INSTANCE_TTL_THRESHOLD_LEDGERS,
+                INSTANCE_TTL_EXTEND_TO_LEDGERS,
+            );
+        }
+
+        env.events().publish(
+            (symbol_short!("split"), account, token),
+            (collected, split_to_others),
+        );
+
+        (collected, split_to_others)
     }
 }
 
