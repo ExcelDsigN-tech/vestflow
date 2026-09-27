@@ -111,6 +111,10 @@ pub enum VestFlowError {
     /// `update_stream_rate` was called for a (funder, token) pair that has no
     /// stream configuration.
     StreamsNotConfigured = 37,
+    /// Item or receiver already exists.
+    AlreadyExists = 38,
+    /// Receivers and amounts vectors have different lengths.
+    LengthMismatch = 39,
 }
 
 #[contracttype]
@@ -3750,27 +3754,35 @@ impl VestFlowContract {
         receivers: Vec<Address>,
         amounts: Vec<i128>,
         token: Address,
-    ) {
+    ) -> Result<(), VestFlowError> {
         sender.require_auth();
-        assert!(
-            receivers.len() == amounts.len(),
-            "Receivers and amounts length mismatch"
-        );
-        assert!(!receivers.is_empty(), "Receivers must not be empty");
+        if receivers.len() != amounts.len() {
+            return Err(VestFlowError::LengthMismatch);
+        }
+        if receivers.is_empty() {
+            return Ok(());
+        }
+
+        // Validate all amounts are positive before transferring
+        for i in 0..amounts.len() {
+            let amount = amounts.get(i).expect("i < len");
+            if amount <= 0 {
+                return Err(VestFlowError::AmountZero);
+            }
+        }
 
         let token_client = token::Client::new(&env, &token);
         for i in 0..receivers.len() {
             let receiver = receivers.get(i).expect("i < len");
             let amount = amounts.get(i).expect("i < len");
-            assert!(amount > 0, "Give amount must be positive");
             token_client.transfer(&sender, &receiver, &amount);
-        }
-        for i in 0..receivers.len() {
             env.events().publish(
                 (symbol_short!("given"), sender.clone(), token.clone()),
-                amounts.get(i).expect("i < len"),
+                amount,
             );
         }
+
+        Ok(())
     }
 
     /// Stream funds to all members of a drips list equally.
@@ -9663,6 +9675,71 @@ mod test {
         for receiver in receivers.iter() {
             assert_eq!(token.balance(&receiver), amount);
         }
+    }
+
+    #[test]
+    fn test_batch_give_two_receivers() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, sender, _, token_address, _) = setup(&env);
+        let token = TokenClient::new(&env, &token_address);
+        let receiver1 = Address::generate(&env);
+        let receiver2 = Address::generate(&env);
+
+        let mut receivers = Vec::new(&env);
+        receivers.push_back(receiver1.clone());
+        receivers.push_back(receiver2.clone());
+
+        let mut amounts = Vec::new(&env);
+        amounts.push_back(100i128);
+        amounts.push_back(250i128);
+
+        let sender_before = token.balance(&sender);
+        client.batch_give(&sender, &receivers, &amounts, &token_address);
+
+        let events = env.events().all();
+        let given_count = events.iter().filter(|(_, topics, _)| {
+            let event: Result<soroban_sdk::Symbol, _> = topics.get(0).unwrap().try_into_val(&env);
+            event.is_ok() && event.unwrap() == symbol_short!("given")
+        }).count();
+        assert_eq!(given_count, 2);
+
+        assert_eq!(token.balance(&sender), sender_before - 350);
+        assert_eq!(token.balance(&receiver1), 100);
+        assert_eq!(token.balance(&receiver2), 250);
+    }
+
+    #[test]
+    fn test_batch_give_length_mismatch() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, sender, _, token_address, _) = setup(&env);
+        let mut receivers = Vec::new(&env);
+        receivers.push_back(Address::generate(&env));
+        receivers.push_back(Address::generate(&env));
+
+        let mut amounts = Vec::new(&env);
+        amounts.push_back(100i128);
+
+        let res = client.try_batch_give(&sender, &receivers, &amounts, &token_address);
+        assert_eq!(res, Err(Ok(VestFlowError::LengthMismatch)));
+    }
+
+    #[test]
+    fn test_batch_give_zero_amount_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, sender, _, token_address, _) = setup(&env);
+        let mut receivers = Vec::new(&env);
+        receivers.push_back(Address::generate(&env));
+        receivers.push_back(Address::generate(&env));
+
+        let mut amounts = Vec::new(&env);
+        amounts.push_back(100i128);
+        amounts.push_back(0i128);
+
+        let res = client.try_batch_give(&sender, &receivers, &amounts, &token_address);
+        assert_eq!(res, Err(Ok(VestFlowError::AmountZero)));
     }
 
     #[test]
